@@ -232,9 +232,20 @@ buildGearbox = function(Sys, Gearbox)
 		input shaft would sit on one side of an open differential and take all the speed while
 		the driven side got no torque.
 	]]
+	--[[
+		Nor is a wheel that cannot reach any engine: every element on every path to a crank is
+		open (gear 0, its side clutch released, the main clutch of a box above it out, the
+		parent passing nothing up). Geared rigidly to a free input shaft anyway, the wheel and
+		the shaft chased each other every solve: the shaft has almost no inertia, so whatever
+		the physics engine did to the wheel came straight back through the ratio, and a parked
+		truck with the CVT declutched crept at 0.4-0.7 m/s on flat ground, its wheels
+		oscillating +-8-10 rad/s per 15 ms solve (DMC L380, wheels on a locked-diff transfer
+		under an open CVT clutch). Such a wheel freewheels on its tyre, rolling drag and
+		brakes alone; brakes are added below over every output, free or not.
+	]]
 	local Sides = { [0] = {}, [1] = {} }
 	for _, Out in ipairs(Gearbox.Outputs or {}) do
-		if not (Out.Gearbox and Out.Gearbox.BrakeOnly) then
+		if not (Out.Gearbox and Out.Gearbox.BrakeOnly) and not (Out.Wheel and Out.Free) then
 			local List = Sides[Out.Side == 0 and 0 or 1]
 			List[#List + 1] = Out
 		end
@@ -314,16 +325,15 @@ buildGearbox = function(Sys, Gearbox)
 		Gearbox.SteerC = addConstraint(Sys, { L, Rt, In }, { 0.5, -0.5, 0 }, Gearbox.SteerCap, 0, "steer")
 	end
 
-	-- Brakes act between each driven wheel and the chassis.
+	-- Brakes act between each driven wheel and the chassis. They reach free wheels too: the
+	-- pedal is a direct clamp on the wheel body, not torque through the gears.
 	Gearbox.Brakes = {}
-	for S = 0, 1 do
-		local Tq = Gearbox.Brake and Gearbox.Brake[S] or 0
-		for _, Out in ipairs(Sides[S]) do
-			if Out.Wheel then
-				local C = addConstraint(Sys, { outputBody(Sys, Out) }, { 1 }, Tq, 0, "brake")
-				C.Wheel = Out.Wheel
-				Gearbox.Brakes[#Gearbox.Brakes + 1] = C
-			end
+	for _, Out in ipairs(Gearbox.Outputs or {}) do
+		if Out.Wheel then
+			local S = Out.Side == 0 and 0 or 1
+			local C = addConstraint(Sys, { outputBody(Sys, Out) }, { 1 }, Gearbox.Brake and Gearbox.Brake[S] or 0, 0, "brake")
+			C.Wheel = Out.Wheel
+			Gearbox.Brakes[#Gearbox.Brakes + 1] = C
 		end
 	end
 

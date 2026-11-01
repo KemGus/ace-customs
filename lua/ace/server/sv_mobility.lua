@@ -875,6 +875,71 @@ local function engineHeldWheels(EngineDescs)
 	return next(Held) and Held or nil
 end
 
+--[[
+	A wheel that cannot exchange torque with any engine is marked free so the solver leaves it
+	to its tyre, rolling drag and brakes alone. Torque can only flow while every element on
+	every path to a crank is shut: gear engaged, the wheel's own side clutch in (a dual box
+	releases a side, not the box), the drive clutch holding, and each chained box above able
+	to pass it up. A stopped engine is NOT a free end - in gear it still holds the wheels
+	through its compression. Open anywhere and the wheel hangs on a free shaft: parked with
+	the CVT declutched (main clutch cap 0), a truck's wheels were geared rigidly to the CVT's
+	nearly inertia-less input shaft through a locked transfer and 20:1, and the solve and the
+	shaft chased each other every step - the truck crept at 0.4-0.7 m/s, wheels oscillating
+	+-8-10 rad/s per 15 ms solve (DMC L380, recordings 20261101_030816+).
+
+	A wheel is fully free (FreeAll) only when every output driving it is: one that is still
+	geared to anything through another box keeps its ground coupling. A fully free wheel
+	gets no Ground below: the solver's tyre constraint is the drivetrain's traction model,
+	and with no shaft behind it the contact VPhysics resolves IS the ground contact. Kept
+	in, the constraint did the pumping on its own: the wheels' hub reference was a light
+	mounting prop the drivetrain's own reaction torque spun to +-560 deg/s, so the wheel
+	read +-10 rad/s, the tyre constraint "braked" it, the reaction spun the hub again, and
+	the loop ran at every solve. Left out, a free wheel answers only rolling drag and
+	brake torque (a brake is a clamp on the wheel body, not torque through the gears).
+]]
+local function markFreeWheels(Ctx, EngineDescs, Roots)
+	local function walk(Desc, InputFree, Depth)
+		if not Desc or Depth > 8 then return end
+		local R = Desc.Ratio or 0
+		local DriveFree = Desc.DriveCap ~= nil and Desc.DriveCap <= 0
+		for _, Out in ipairs(Desc.Outputs or {}) do
+			local S = Out.Side == 0 and 0 or 1
+			-- A side clutch capacity of nil is no clutch at all (rigid); only an explicit
+			-- zero releases the side.
+			local SideFree = false
+			if Desc.Dual and Desc.SideCap then
+				local Cap = Desc.SideCap[S]
+				SideFree = Cap ~= nil and Cap <= 0
+			end
+			local Open = InputFree or R == 0 or DriveFree or SideFree
+			if Out.Wheel then
+				Out.Free = Open or nil
+			elseif Out.Gearbox and not Out.Gearbox.BrakeOnly then
+				local Child = Out.Gearbox
+				walk(Child, Open or (Child.ClutchCap ~= nil and Child.ClutchCap <= 0), Depth + 1)
+			end
+		end
+	end
+	for _, E in ipairs(EngineDescs or {}) do
+		for _, Desc in ipairs(E.Gearboxes or {}) do
+			-- The main clutch is the crank's coupling: a dual box is rigid at the input (its
+			-- side clutches are the disconnects, checked per output) and a converter always
+			-- drags. nil capacity is a direct drive, not an open clutch.
+			local Free = not Desc.Dual and not Desc.Converter and Desc.ClutchCap ~= nil and Desc.ClutchCap <= 0
+			walk(Desc, Free, 0)
+		end
+	end
+	-- A gearbox tree no engine drives (a trailer axle that only brakes) is free from the top.
+	for _, Desc in ipairs(Roots or {}) do walk(Desc, true, 0) end
+
+	for _, W in ipairs(Ctx.WheelList) do W.FreeAll = true end
+	for _, Box in ipairs(Ctx.BoxList) do
+		for _, Out in ipairs(Box.Mob and Box.Mob.Outputs or {}) do
+			if Out.Wheel and not Out.Free then Out.Wheel.FreeAll = false end
+		end
+	end
+end
+
 -- EngineDescs and Roots (gearbox trees no engine drives) are what Drivetrain.Build takes.
 -- The physics engine's spin cap in rad/s, with a margin for the chassis' own rotation (the cap
 -- applies to the wheel's total angular velocity, spin is measured against the hub).
@@ -965,6 +1030,7 @@ local function solveGroup(Ctx, EngineDescs, Roots, PhysMass, TotalMass, Dt)
 	local ChassisPhys = IsValid(Ctx.Chassis) and Ctx.Chassis:GetPhysicsObject()
 	local ChassisFrozen = IsValid(ChassisPhys) and not ChassisPhys:IsMotionEnabled()
 	local EngineHeld = engineHeldWheels(EngineDescs)
+	markFreeWheels(Ctx, EngineDescs, Roots)
 
 	--[[
 		Brake bias. A stop moves load onto the wheels ahead of the centre of mass (in the
@@ -1050,7 +1116,7 @@ local function solveGroup(Ctx, EngineDescs, Roots, PhysMass, TotalMass, Dt)
 		W.HeldStill = Held or nil
 		W.Anchored = IsValid(W.BrakeLock) or nil
 		W.Braking = (Pedal or 0) > 0
-		W.Ground = not Held and Vehicle.Ground(Share, W.Radius, W.GroundSpeed, W.Mu, Share * Gravity, W.Grounded, W.W, W.Meshed) or nil
+		W.Ground = not Held and not W.FreeAll and Vehicle.Ground(Share, W.Radius, W.GroundSpeed, W.Mu, Share * Gravity, W.Grounded, W.W, W.Meshed) or nil
 		-- The wheel's share of the vehicle standing on it with the slope pulling, for staticHold.
 		W.RestGround = nil
 		if W.Grounded and not W.Meshed and W.Radius > 0 then
@@ -1233,12 +1299,21 @@ local function solveGroup(Ctx, EngineDescs, Roots, PhysMass, TotalMass, Dt)
 				through its suspension links. The same goes for any mounting too light about the
 				axle to hold the wheel's spin.
 			]]
-			local Root = ACE.GetPhysicalParent(W.Box)
-			if IsValid(Ctx.Chassis) and IsValid(Root) and Root ~= Ctx.Chassis and (Root == W.Hub or W.Hub == Ctx.Chassis) then
-				Root = Ctx.Chassis
+			--[[
+				A fully free wheel carries no drivetrain torque, so there is no shaft reaction
+				to deposit: whatever its mount is is left alone. On the DMC L380 the rear
+				wheels' hub reference was a light rotary-engine prop, and the reaction alone
+				spun it +-560 deg/s each solve - which the next read took for wheel spin,
+				keeping the parked-creep limit cycle alive after the wheels were freed.
+			]]
+			if not W.FreeAll then
+				local Root = ACE.GetPhysicalParent(W.Box)
+				if IsValid(Ctx.Chassis) and IsValid(Root) and Root ~= Ctx.Chassis and (Root == W.Hub or W.Hub == Ctx.Chassis) then
+					Root = Ctx.Chassis
+				end
+				local RootPhys = IsValid(Root) and Root:GetPhysicsObject()
+				if IsValid(RootPhys) then RootPhys:ApplyTorqueCenter(W.AxisWorld * Src) end
 			end
-			local RootPhys = IsValid(Root) and Root:GetPhysicsObject()
-			if IsValid(RootPhys) then RootPhys:ApplyTorqueCenter(W.AxisWorld * Src) end
 		end
 	end
 end
