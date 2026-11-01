@@ -938,18 +938,37 @@ function ENT:MobilityControl(Dt)
 	local Cap = (self.LClutch or Max) * RateScale * Fade
 	self.MobSideScale = RateScale * Fade
 	if Assisted and IsValid(Engine) and Engine.MobState and Engine.MobSpec then
+		local State, Spec = Engine.MobState, Engine.MobSpec
 		-- Automatic clutch: fully out while shifting, eased back in afterwards, and slipped
 		-- like a centrifugal clutch at launch so the engine cannot stall.
-		local Launch = ACE.Mobility.Vehicle.AssistedClutch(Engine.MobState, Engine.MobSpec, Rated, Pedal, Throttle)
+		local Launch = ACE.Mobility.Vehicle.AssistedClutch(State, Spec, Rated, Pedal, Throttle)
 		--[[
 			With the engine off (and not cranking) the clutch is let in, as a driver parks a
 			manual in gear: the stopped engine holds the car. Left out, every assisted car was in
 			neutral whenever its engine was off and rolled or rocked on its suspension.
 		]]
-		local State = Engine.MobState
 		if not State.Running and (State.Cranking or 0) <= 0 then
 			Launch = Rated * (1 - math.Clamp(Pedal, 0, 1))
 		end
+		--[[
+			Lock-up: the centrifugal curve alone has no hysteresis, so an engine that cannot
+			out-rev its engagement point slips the clutch for as long as the load lasts (a
+			diesel lugging a hill below ~2,000 rpm, a high-strung engine held under the CVT's
+			target band) and the facings cook at full throttle. Once the shaft has caught up
+			with the engine, clamp the clutch like a driver does; reopen near idle so the
+			engine is not dragged into a stall, and let shifts re-sync normally.
+		]]
+		local Locked = false
+		if State.Running and not Shifting and not self.PendingEngage and Pedal < 0.15 then
+			if self.MobAssistLocked then
+				Locked = math.abs(State.W) > Spec.IdleW * 0.9
+			else
+				local Slip = math.abs((Mob.InputW or 0) - State.W)
+				Locked = Slip < math.max(15, math.abs(State.W) * 0.05)
+			end
+		end
+		self.MobAssistLocked = Locked
+		if Locked then Launch = Rated * (1 - math.Clamp(Pedal, 0, 1)) end
 		local Since = Now - (self.EngagedAt or 0)
 		local Ease = math.Clamp(Since / 0.3, 0, 1)
 		Cap = (Shifting or self.PendingEngage) and 0 or math.min(Launch, Rated * Ease) * Fade
