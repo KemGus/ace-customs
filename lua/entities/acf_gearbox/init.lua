@@ -705,6 +705,9 @@ function ENT:MobilityControl(Dt)
 	local Mob = self.Mob or {}
 	local Engine = masterEngine(self)
 	local Throttle = IsValid(Engine) and Engine.Throttle or 0
+	-- Kept for the flight log and the over-torque cause, whichever path below runs.
+	self.MobEngineW = IsValid(Engine) and Engine.MobState and Engine.MobState.W or nil
+	self.MobThrottle = Throttle
 	local Assisted = ACE.Mobility.IsAssisted(self)
 	local Fade = self:ClutchCapacityScale()
 
@@ -789,6 +792,7 @@ function ENT:MobilityControl(Dt)
 		self.MobFade = Fade
 		self.MobSideScale = 1
 		self.MobCapFull = false
+		self.MobAssistWhy = nil
 		return
 	end
 
@@ -937,6 +941,7 @@ function ENT:MobilityControl(Dt)
 
 	local Cap = (self.LClutch or Max) * RateScale * Fade
 	self.MobSideScale = RateScale * Fade
+	self.MobAssistWhy = nil
 	if Assisted and IsValid(Engine) and Engine.MobState and Engine.MobSpec then
 		local State, Spec = Engine.MobState, Engine.MobSpec
 		-- Automatic clutch: fully out while shifting, eased back in afterwards, and slipped
@@ -958,16 +963,28 @@ function ENT:MobilityControl(Dt)
 			with the engine, clamp the clutch like a driver does; reopen near idle so the
 			engine is not dragged into a stall, and let shifts re-sync normally.
 		]]
-		local Locked = false
-		if State.Running and not Shifting and not self.PendingEngage and Pedal < 0.15 then
-			if self.MobAssistLocked then
-				Locked = math.abs(State.W) > Spec.IdleW * 0.9
-			else
-				local Slip = math.abs((Mob.InputW or 0) - State.W)
-				Locked = Slip < math.max(15, math.abs(State.W) * 0.05)
-			end
+		local Locked, Why = false, "unsynced"
+		if not State.Running then
+			Why = "engine_off"
+		elseif Shifting then
+			Why = "shifting"
+		elseif self.PendingEngage then
+			Why = "pending_engage"
+		elseif Pedal >= 0.15 then
+			Why = "pedal"
+		elseif self.MobAssistLocked then
+			Locked = math.abs(State.W) > Spec.IdleW * 0.9
+			Why = Locked and "locked" or "near_idle"
+		else
+			local Slip = math.abs((Mob.InputW or 0) - State.W)
+			Locked = Slip < math.max(15, math.abs(State.W) * 0.05)
+			Why = Locked and "locked" or "unsynced"
 		end
-		self.MobAssistLocked = Locked
+		if self.MobAssistLocked ~= Locked and ACE.Mobility.Log then
+			ACE.Mobility.Log.Event(self, "assist_lock", string.format("%s (%s) engine %.0f rpm shaft %.0f rpm throttle %.2f pedal %.2f gear %s",
+				Locked and "on" or "off", Why, State.W * 30 / math.pi, (Mob.InputW or 0) * 30 / math.pi, Throttle, Pedal, tostring(self.Gear)))
+		end
+		self.MobAssistLocked, self.MobAssistWhy = Locked, Why
 		if Locked then Launch = Rated * (1 - math.Clamp(Pedal, 0, 1)) end
 		local Since = Now - (self.EngagedAt or 0)
 		local Ease = math.Clamp(Since / 0.3, 0, 1)
@@ -993,6 +1010,28 @@ local function clutchSaturated(C)
 	return math.abs(C.Acc or 0) >= 0.97 * C.Max and Slip > 3
 end
 
+-- Why a saturated clutch most likely could not carry the torque, for the flight log. Only a
+-- label; the over-torque decision above is unchanged.
+local function overTorqueCause(Box, Mob)
+	if Box.ClutchBurnt then return "burnt" end
+	if (Box.MobFade or 1) < 0.95 then return "fade" end
+	local Shaft, Eng = Mob.InputW or 0, Box.MobEngineW or 0
+	if Box.CVT and Box.Gear == 1 and math.abs(Shaft) * 30 / math.pi < (Box.TargetMinRPM or 0)
+		and math.abs(Eng) > math.abs(Shaft) then
+		return "cvt_low"
+	end
+	-- The shaft outruns the engine: the wheels drag the engine (overrun), or engine-brake it
+	-- when the driver's foot is off.
+	if Shaft * Eng >= 0 and math.abs(Shaft) > math.abs(Eng) and math.abs(Shaft) > 1 then
+		return (Box.MobThrottle or 0) < 0.05 and "overrun_engine_braking" or "overrun"
+	end
+	-- Foot off and the engine still outruns the shaft: brakes or the road slow the wheels
+	-- faster than the clutch can slow the engine's spinning mass.
+	if (Box.MobThrottle or 0) < 0.05 and math.abs(Eng) > math.abs(Shaft) then return "engine_inertia" end
+	if Box.MobRatingLimited then return "rating" end
+	return "engine"
+end
+
 --[[
 	Over-torque: the engine sends more torque than the fully engaged clutch can carry (the
 	gearbox torque rating is below what the engine makes, or the clutch is hot and fading), so
@@ -1011,13 +1050,53 @@ function ENT:UpdateOverTorque(Mob, Dt)
 		end
 	end
 
+	local Log = ACE.Mobility.Log
+	local Input, Cap = Mob.Input, Mob.Input and Mob.Input.Max
+	if Cap and Cap > 0 and Cap ~= math.huge then
+		self.MobClutchLoad = math.abs(Input.Acc or 0) / Cap
+	else
+		self.MobClutchLoad = nil
+	end
+	self.MobClutchSat = Slipping
+
+	if Log then
+		-- Saturation episodes: brief slips (one call, a bump) are noise; longer ones get a
+		-- summary line with the peak slip and the most likely cause.
+		if Slipping and not self.MobSatSince then
+			self.MobSatSince, self.MobSatTicks, self.MobSatPeak, self.MobSatOver = CurTime(), 0, 0, false
+		end
+		if Slipping then
+			self.MobSatTicks = self.MobSatTicks + 1
+			self.MobSatPeak = math.max(self.MobSatPeak, math.abs(Mob.ClutchSlip or 0))
+			if self.OverTorque then self.MobSatOver = true end
+		elseif self.MobSatSince then
+			if self.MobSatTicks >= 2 then
+				local BrakeL = ACE.Mobility.BrakePedal and ACE.Mobility.BrakePedal(self.LBrake) or -1
+				local BrakeR = ACE.Mobility.BrakePedal and ACE.Mobility.BrakePedal(self.RBrake) or -1
+				Log.Event(self, "clutch_sat", string.format("%.2f s peak %.0f rpm cause %s over %s brake %.2f/%.2f",
+					CurTime() - self.MobSatSince, self.MobSatPeak * 30 / math.pi, overTorqueCause(self, Mob),
+					tostring(self.MobSatOver), BrakeL, BrakeR))
+			end
+			self.MobSatSince = nil
+		end
+	end
+
 	-- Brief slips (a shift, a bump) do not count: the state needs a quarter second to set.
 	self.OverTorqueTime = Slipping and (self.OverTorqueTime or 0) + Dt or 0
 	local Over = self.OverTorqueTime > 0.25 or (self.OverTorque and Slipping) or false
 	if Over ~= (self.OverTorque or false) then
 		self.OverTorque = Over
+		self.OverTorqueCause = Over and overTorqueCause(self, Mob) or nil
 		Wire_TriggerOutput(self, "Over Torque", Over and 1 or 0)
 		self:UpdateOverlayText()
+
+		if Log then
+			Log.Event(self, "over_torque", string.format("%s cause %s engine %.0f rpm shaft %.0f rpm slip %.0f rpm load %s throttle %.2f gear %s ratio %s temp %.0f fade %.2f assist %s(%s)",
+				Over and "on" or "off", tostring(self.OverTorqueCause), (self.MobEngineW or 0) * 30 / math.pi,
+				(Mob.InputW or 0) * 30 / math.pi, (Mob.ClutchSlip or 0) * 30 / math.pi,
+				tostring(self.MobClutchLoad), self.MobThrottle or 0, tostring(self.Gear), tostring(Mob.Ratio),
+				self.ClutchTemp or 0, self.MobFade or 1, tostring(self.MobAssistLocked), tostring(self.MobAssistWhy)))
+		end
 
 		if Over and CurTime() > (self.NextOverTorqueHint or 0) then
 			self.NextOverTorqueHint = CurTime() + 15

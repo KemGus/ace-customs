@@ -15,7 +15,9 @@
 	Files (one folder per save):
 	  setup.txt   server settings, every entity of the vehicle and every constraint between them
 	  events.csv  brake locks made and released (and why), load latches, gear and pedal changes,
-	              markers, the drivetrain switching between in-step and per-tick solving
+	              markers, the drivetrain switching between in-step and per-tick solving,
+	              assist_lock (assisted clutch in/out and why), clutch_sat (a saturated-clutch
+	              episode's length, peak slip and cause), over_torque (on/off with the cause)
 	  frames.csv  one row per solve: chassis position, angles, velocity and spin in its own frame
 	  wheels.csv  one row per wheel per solve: everything the solver read and applied
 	  boxes.csv   one row per gearbox per solve: gear, pedals, clutch, differential
@@ -126,7 +128,8 @@ function Log.Frame(Kind, Group, Ctx, Dt)
 		if IsValid(E) then
 			local St = E.MobState or {}
 			Bundle.Engines[#Bundle.Engines + 1] = row({ Head, id(E), E.Active == true, St.Running == true, St.Stalled == true,
-				St.Cranking or 0, E.FlyRPM or 0, E.Throttle or 0, E.Torque or 0, E.PhysMass or 0, E.TotalMass or 0, id(E.MobLeader) })
+				St.Cranking or 0, E.FlyRPM or 0, E.Throttle or 0, E.Torque or 0, E.PhysMass or 0, E.TotalMass or 0, id(E.MobLeader),
+				(St.W or 0) * 30 / math.pi, E.MobSpec and E.MobSpec.IdleRPM or "" })
 			if Rec.Last[E] ~= E.Active then
 				if Rec.Last[E] ~= nil then Log.Event(E, "engine", E.Active and "switched on" or "switched off") end
 				Rec.Last[E] = E.Active
@@ -140,7 +143,14 @@ function Log.Frame(Kind, Group, Ctx, Dt)
 			Bundle.Boxes[#Bundle.Boxes + 1] = row({ Head, id(Box), Box.Gear or 0, D.Ratio or 0, Box.LBrake or 0, Box.RBrake or 0,
 				M.BrakePedal(Box.LBrake), M.BrakePedal(Box.RBrake), Box.LClutch or 0, Box.RClutch or 0, Box.MobClutchCap or "",
 				Box.MobCapFull == true, D.ClutchFree == true, tostring(D.Diff), (D.InputW or 0) * 30 / math.pi, M.IsAssisted(Box),
-				D.BrakeOnly == true, Box.SteerRate or 0, (D.Brake or {})[0] or 0, (D.Brake or {})[1] or 0, id(ACE.GetPhysicalParent(Box)), Box.ClutchTemp or "", D.ClutchHeatJ or 0, Box.ClutchLife or 1, Box.MobFade or 1 })
+				D.BrakeOnly == true, Box.SteerRate or 0, (D.Brake or {})[0] or 0, (D.Brake or {})[1] or 0, id(ACE.GetPhysicalParent(Box)), Box.ClutchTemp or "", D.ClutchHeatJ or 0, Box.ClutchLife or 1, Box.MobFade or 1,
+				Box.MobEngineW and Box.MobEngineW * 30 / math.pi or "", D.ClutchSlip and D.ClutchSlip * 30 / math.pi or "",
+				D.Input and D.Input.Acc or "", D.Input and D.Input.Max and D.Input.Max ~= math.huge and D.Input.Max or "",
+				Box.MobClutchLoad, Box.MobClutchSat == true, Box.MobAssistLocked == true, Box.MobAssistWhy or "",
+				(Box.ChangeFinished or 0) > T, Box.PendingEngage == true, Box.OverTorque == true, Box.OverTorqueTime,
+				Box.OverTorqueCause or "", Box.MobEngineTorque, Box.MobClutchRated, Box.MobRatingLimited == true,
+				D.OutputTorque, D.LSlip and D.LSlip * 30 / math.pi or "", D.RSlip and D.RSlip * 30 / math.pi or "",
+				Box.MobThrottle })
 			local Key = format("gear %s, brakes %.2f/%.2f, clutch %.0f/%.0f", tostring(Box.Gear), Box.LBrake or 0, Box.RBrake or 0,
 				Box.LClutch or 0, Box.RClutch or 0)
 			if Rec.Last[Box] ~= Key then
@@ -282,8 +292,8 @@ end
 
 local Headers = {
 	frames = "frame,t,tick,kind,dt,chassis,x,y,z,pitch,yaw,roll,vel_fwd,vel_left,vel_up,angvel_x,angvel_y,angvel_z,speed_kmh,frozen,asleep,wheels,instep\n",
-	engines = "frame,t,tick,kind,dt,engine,active,running,stalled,cranking,rpm,throttle,torque,phys_mass,total_mass,leader\n",
-	boxes = "frame,t,tick,kind,dt,box,gear,ratio,lbrake_in,rbrake_in,lbrake_pedal,rbrake_pedal,lclutch,rclutch,clutch_cap,cap_full,clutch_free,diff,input_rpm,assisted,brake_only,steer,brake_torque_l,brake_torque_r,phys_parent,clutch_temp,clutch_heat_j,clutch_life,fade\n",
+	engines = "frame,t,tick,kind,dt,engine,active,running,stalled,cranking,rpm,throttle,torque,phys_mass,total_mass,leader,state_rpm,idle_rpm\n",
+	boxes = "frame,t,tick,kind,dt,box,gear,ratio,lbrake_in,rbrake_in,lbrake_pedal,rbrake_pedal,lclutch,rclutch,clutch_cap,cap_full,clutch_free,diff,input_rpm,assisted,brake_only,steer,brake_torque_l,brake_torque_r,phys_parent,clutch_temp,clutch_heat_j,clutch_life,fade,engine_rpm,clutch_slip_rpm,clutch_acc,clutch_max,clutch_load,clutch_sat,assist_locked,assist_why,shifting,pending_engage,over_torque,over_torque_time,over_torque_cause,engine_torque,clutch_rated,rating_limited,output_torque,lslip_rpm,rslip_rpm,throttle\n",
 	wheels = "frame,t,tick,kind,dt,wheel,box,side,hub,grounded,meshed,loaded,load_ema,free_ticks,player_held,held_still,anchored,lock_want,lock_on,lock_why,braking,pedal,brake_max,brake_slipped,anchor_torque,mu,radius,J,w,w_out,ground_speed,ground_speed_as_w,ground_w,ground_cap,impulse,ground_impulse,impulse_applied,applied_dw,tyre_imp,slide_cap,roll_drag,spin_vs_hub_x,spin_vs_hub_y,spin_vs_hub_z,asleep\n",
 	bodies = "frame,t,tick,kind,dt,body,is_chassis,is_hub,x,y,z,vel_x,vel_y,vel_z,angvel_x,angvel_y,angvel_z,angvel_vs_chassis_x,angvel_vs_chassis_y,angvel_vs_chassis_z,frozen,asleep\n",
 }
