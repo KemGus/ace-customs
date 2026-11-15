@@ -331,6 +331,56 @@ do
 	near(E1.State.W, E2.State.W, 0.05 * E1.State.W, "twin engines turn together through a locked clutch")
 end
 
+------------------------------------------------------------------ two drivetrains on one wheel
+do
+	-- The DMC L380 layout: two independent engine/gearbox paths ending on the SAME wheel
+	-- record. One wheel body, and after the step both boxes measure input = R x wheel W
+	-- with their clutches locked, instead of each solve dragging the other's wheels back.
+	local Spec = M.Engine.Build(V8, ACE.GenericTorqueCurves.V8)
+	local function engine(W)
+		local State = M.Engine.NewState(Spec)
+		State.W, State.Running = W, true
+		return { Spec = Spec, State = State, Throttle = 1, HasFuel = true, NoStall = true }
+	end
+	local function wheel(Key)
+		return { Key = Key, J = 1.2, W = 0, Ground = M.Vehicle.Ground(800, 0.33, 0, 0.9, 800 * 9.81, true) }
+	end
+	local function box(Key, Ratio, Wheel, Sign)
+		return { Key = Key, Ratio = Ratio, InputJ = 0.03, ClutchCap = 1e5, Diff = "open",
+			Brake = { [0] = 0, [1] = 0 }, Outputs = { { Side = 0, Wheel = Wheel, Sign = Sign } } }
+	end
+	local Shared = wheel("rear")
+	local E1, E2 = engine(300), engine(300)
+	E1.Gearboxes, E2.Gearboxes = { box("b1", 3, Shared) }, { box("b2", 2, Shared) }
+	local Sys = M.Drivetrain.Build({ Engines = { E1, E2 } })
+	check(#Sys.Wheels == 1, "a shared wheel is one body", #Sys.Wheels)
+	for _ = 1, 66 do M.Drivetrain.Step(Sys, 1 / 66, 8) end
+	check(math.abs(E1.Gearboxes[1].ClutchSlip or 0) < 1, "box A clutch locked", E1.Gearboxes[1].ClutchSlip)
+	check(math.abs(E2.Gearboxes[1].ClutchSlip or 0) < 1, "box B clutch locked", E2.Gearboxes[1].ClutchSlip)
+	near(E1.Gearboxes[1].InputW, 3 * Shared.WOut, 1e-6, "box A input = R x wheel W")
+	near(E2.Gearboxes[1].InputW, 2 * Shared.WOut, 1e-6, "box B input = R x wheel W")
+
+	-- A box facing the other way: output Sign -1 with a negated ratio drives the wheel the
+	-- same way (it sees output speed as Sign * W). Its push adds to engine A's.
+	local function run(Second)
+		local W = wheel("rear")
+		local EA = engine(300)
+		EA.Gearboxes = { box("ba", 3, W) }
+		local EB
+		if Second then
+			EB = engine(300)
+			EB.Gearboxes = { box("bb", -2, W, -1) }
+		end
+		local S = M.Drivetrain.Build({ Engines = EB and { EA, EB } or { EA } })
+		for _ = 1, 66 do M.Drivetrain.Step(S, 1 / 66, 8) end
+		return W.WOut, EB
+	end
+	local Alone = run(false)
+	local Both, EB = run(true)
+	check(math.abs(EB.Gearboxes[1].ClutchSlip or 0) < 1, "flipped box clutch locked", EB.Gearboxes[1].ClutchSlip)
+	check(Both > Alone, "flipped box drives the wheel the same way, adding speed", Both, Alone)
+end
+
 ------------------------------------------------------------------ automatic with converter
 do
 	local V = car(1 / 66, { Converter = true, StallRPM = 2200 })

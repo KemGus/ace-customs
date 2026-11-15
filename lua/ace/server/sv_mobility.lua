@@ -234,13 +234,69 @@ end
 	physics object is not simulated, so a constraint to it would hold nothing: its physical
 	parent is used.
 ]]
+local wheelOwners -- defined further down (wheel entity -> gearboxes linked to it)
+
+--[[
+	The body the drivetrain measures a wheel's spin against, and the body the mount reaction
+	is deposited on. GetPhysicalParent alone only climbs parents: on a build whose drivetrain
+	props are welded to the frame instead, every prop is its own physical root, so the engine
+	prop becomes "the chassis" and light welded boxes take the whole reaction torque. On the
+	DMC L380 every engine and gearbox is welded straight to the frame plate: the wheels' hub
+	reference was the I6 prop itself, whose angvel_x wobbled 25-1080 deg/s per solve and was
+	read as wheel spin (the 6-speed clutch slipped at its cap against it in gears 3-5), and
+	the mount reaction alone was deposited on the 67 kg T-M, which VPhysics deleted for
+	crazy angular velocity (recordings 20261102_013557+). So: from the physical root, walk
+	Weld constraints only, never into a linked drivetrain wheel (wheelOwners), and take the
+	heaviest valid body found - on the L380 the 1000 kg frame plate, on parented builds the
+	same body GetPhysicalParent returned before.
+]]
+local function mountBody(Ent)
+	local Cached = Ent.MobMountBody
+	if Cached and CurTime() < (Ent.MobMountAt or 0) then return Cached end
+
+	local Root = ACE.GetPhysicalParent(Ent) or Ent
+	local RootPhys = IsValid(Root) and Root:GetPhysicsObject()
+	local Best = Root
+	local BestMass = IsValid(RootPhys) and RootPhys:GetMass() or 0
+
+	local Owners = wheelOwners()
+	local Seen, Queue = { [Root] = true }, { Root }
+	local Steps = 0
+	while #Queue > 0 and Steps < 64 do
+		Steps = Steps + 1
+		local E = table.remove(Queue)
+		local Phys = IsValid(E) and E:GetPhysicsObject()
+		if IsValid(Phys) then
+			local Mass = Phys:GetMass()
+			if Mass > BestMass then Best, BestMass = E, Mass end
+		end
+		for _, C in pairs(constraint.GetTable(E) or {}) do
+			if C.Type == "Weld" then
+				for _, P in pairs(C.Entity) do
+					local Other = P.Entity
+					if IsValid(Other) and Other ~= E and not (Owners[Other] and #Owners[Other] > 0) then
+						local Body = ACE.GetPhysicalParent(Other) or Other
+						if IsValid(Body) and not Seen[Body] then
+							Seen[Body] = true
+							Queue[#Queue + 1] = Body
+						end
+					end
+				end
+			end
+		end
+	end
+
+	Ent.MobMountBody, Ent.MobMountAt = Best, CurTime() + 2
+	return Best
+end
+
 local function wheelHub(W, Chassis)
 	local WheelPhys = W.Ent:GetPhysicsObject()
 	local WheelMass = IsValid(WheelPhys) and WheelPhys:GetMass() or 0
 	for _, C in ipairs(constraint.FindConstraints(W.Ent, "Axis")) do
 		local Other = C.Ent1 == W.Ent and C.Ent2 or C.Ent1
 		if IsValid(Other) and Other ~= W.Ent then
-			Other = ACE.GetPhysicalParent(Other) or Other
+			Other = mountBody(Other)
 			--[[
 				A prop much lighter than the wheel on an axis is a decoration turning with or
 				around it (a brake caliper, a hubcap), not what the wheel turns against: a brake
@@ -254,7 +310,7 @@ local function wheelHub(W, Chassis)
 			end
 		end
 	end
-	local Mount = ACE.GetPhysicalParent(W.Box)
+	local Mount = mountBody(W.Box)
 	if IsValid(Mount) and IsValid(Chassis) and Mount ~= Chassis and not canHoldSpin(Mount, W.Ent, W.AxisWorld) then return Chassis end
 	return Mount
 end
@@ -322,7 +378,7 @@ local function spinGroup(W, Ctx)
 	local Skip = { [W.Ent] = true }
 	if IsValid(Ctx.Chassis) then Skip[Ctx.Chassis] = true end
 	if IsValid(W.Hub) then Skip[W.Hub] = true end
-	local Mount = ACE.GetPhysicalParent(W.Box)
+	local Mount = mountBody(W.Box)
 	if IsValid(Mount) then Skip[Mount] = true end
 	local Members, Queue = {}, { W.Ent }
 	while #Queue > 0 and #Members < SpinGroupMax do
@@ -433,16 +489,30 @@ local function readWheel(Box, Link, BoxAngVel, Ctx)
 	local Phys = Ent:GetPhysicsObject()
 	if not IsValid(Phys) then return nil end
 
-	local Desc = Link.Mob
+	--[[
+		The record lives on the wheel, not the link: a wheel linked to two gearboxes (the
+		DMC L380's rear wheels sit under both transfers) is one wheel with one history, not
+		two records each of which reads the other drivetrain's kick as outside interference.
+		AxisLocal is canonical: set by the first link ever to read the wheel. A link that
+		reads it round a different axle (|dot| < 0.9) reads a different spin, so the history
+		is dropped rather than mixed (the wheel is then re-read on that link's axis).
+	]]
+	local Desc = Ent.ACEMobWheel
 	if not Desc then
-		Desc = { Key = Ent }
-		Link.Mob = Desc
+		Desc = { Key = Ent, AxisLocal = Link.Axis }
+		Ent.ACEMobWheel = Desc
+	else
+		local A, B = Link.Axis, Desc.AxisLocal
+		if A and B and abs(A:Dot(B)) < 0.9 * A:Length() * B:Length() then
+			Desc.AxisLocal = A
+			Desc.W, Desc.WOut, Desc.AppliedDW, Desc.OwnRadius = nil, nil, nil, nil
+		end
 	end
 	Desc.Ent, Desc.Phys, Desc.Box, Desc.Link = Ent, Phys, Box, Link
 
-	local AxisWorld = Phys:LocalToWorldVector(Link.Axis)
+	local AxisWorld = Phys:LocalToWorldVector(Desc.AxisLocal)
 	Desc.AxisWorld = AxisWorld
-	Desc.OwnRadius = Desc.OwnRadius or wheelRadius(Ent, Link.Axis)
+	Desc.OwnRadius = Desc.OwnRadius or wheelRadius(Ent, Desc.AxisLocal)
 	Desc.Radius = Desc.OwnRadius
 
 	-- Forward rotation is about -axis (the convention the old drivetrain used).
@@ -471,7 +541,7 @@ local function readWheel(Box, Link, BoxAngVel, Ctx)
 		10 rad/s faster than the chassis (no suspension arm swings that fast) gives way to the
 		chassis.
 	]]
-	local Root = ACE.GetPhysicalParent(Box)
+	local Root = mountBody(Box)
 	local RootPhys = IsValid(Root) and Root:GetPhysicsObject()
 	if IsValid(HubPhys) and IsValid(RootPhys) and RootPhys ~= HubPhys then
 		local RootAngVel = RootPhys:LocalToWorldVector(RootPhys:GetAngleVelocity())
@@ -607,7 +677,7 @@ local function readWheel(Box, Link, BoxAngVel, Ctx)
 	end
 
 	-- Own inertia about the axle.
-	Desc.J = max((Link.Axis * Phys:GetInertia()):Length() * Units.SourceInertiaToSI, 1e-3)
+	Desc.J = max((Desc.AxisLocal * Phys:GetInertia()):Length() * Units.SourceInertiaToSI, 1e-3)
 	if Desc.GroupJ then Desc.J = Desc.J + Desc.GroupJ - Desc.OwnJ end
 
 	Desc.Grounded = not Upright and (Tr.Hit or Desc.Loaded == true)
@@ -627,7 +697,7 @@ local function readWheel(Box, Link, BoxAngVel, Ctx)
 	local Fwd = (-AxisWorld):Cross(Vector(0, 0, 1))
 	if Fwd:LengthSqr() > 1e-6 then
 		Fwd:Normalize()
-		local Root = ACE.GetPhysicalParent(Box)
+		local Root = mountBody(Box)
 		local RootPhys = IsValid(Root) and Root:GetPhysicsObject()
 		local Vel = IsValid(RootPhys) and RootPhys:GetVelocityAtPoint(Center) or Phys:GetVelocity()
 		Desc.GroundSpeed = Vel:Dot(Fwd) * InchToMeter
@@ -714,14 +784,24 @@ buildGearbox = function(Box, Ctx)
 				Desc.Outputs[#Desc.Outputs + 1] = { Side = Link.Side, Gearbox = buildGearbox(Ent, Ctx) }
 			end
 		else
-			local Wheel = readWheel(Box, Link, BoxAngVel, Ctx)
-			if Wheel then
-				Desc.Outputs[#Desc.Outputs + 1] = { Side = Link.Side, Wheel = Wheel }
-				Desc.WheelDescs[#Desc.WheelDescs + 1] = Wheel
-				if not Ctx.Wheels[Wheel.Key] then
+			--[[
+				A wheel linked to several boxes is read once per solve (readWheel), and every
+				link to it gets an output on the same record. Sign is the direction this box
+				sees the wheel's spin in: its link axis may point the other way than the axis
+				the record was built on, and then its output speed is -W.
+			]]
+			local Wheel = Ctx.Wheels[Ent]
+			if not Wheel then
+				Wheel = readWheel(Box, Link, BoxAngVel, Ctx)
+				if Wheel then
 					Ctx.Wheels[Wheel.Key] = Wheel
 					Ctx.WheelList[#Ctx.WheelList + 1] = Wheel
 				end
+			end
+			if Wheel then
+				local Sign = Wheel.Phys:LocalToWorldVector(Link.Axis):Dot(Wheel.AxisWorld) >= 0 and 1 or -1
+				Desc.Outputs[#Desc.Outputs + 1] = { Side = Link.Side, Wheel = Wheel, Sign = Sign }
+				Desc.WheelDescs[#Desc.WheelDescs + 1] = Wheel
 			end
 		end
 	end
@@ -736,9 +816,44 @@ M.GearboxDesc = function(Box, Ctx) return buildGearbox(Box, Ctx) end
 
 ------------------------------------------------------------------------ groups
 
--- Every engine connected to Engine through shared gearboxes.
+-- Wheel entity -> every gearbox linked to it, rebuilt once per tick: two drivetrains
+-- that push the same wheel are one drivetrain (the DMC L380's rear wheels take both
+-- the 6-speed's and the CVT's transfer).
+local WheelOwners, WheelOwnersTick = {}, -1
+wheelOwners = function()
+	local T = engine.TickCount()
+	if WheelOwnersTick == T then return WheelOwners end
+	WheelOwnersTick = T
+	WheelOwners = {}
+	for _, Box in ipairs(ents.FindByClass("acf_gearbox")) do
+		for _, Link in pairs(Box.WheelLink or {}) do
+			local Ent = Link.Ent
+			if IsValid(Ent) and not Link.Notvalid and not Ent.IsGeartrain then
+				local L = WheelOwners[Ent]
+				if not L then
+					L = {}
+					WheelOwners[Ent] = L
+				end
+				L[#L + 1] = Box
+			end
+		end
+	end
+	return WheelOwners
+end
+
+--[[
+	Every engine connected to Engine through shared gearboxes, plus the gearbox trees the
+	group reaches through shared wheels that no engine drives (returned as Roots). A wheel
+	under two boxes ties their drivetrains into one: as separate groups each solve pushed
+	the wheel inside the same physics step and the other's impulse read as the tyre's, so
+	the I6 group's solve dragged the rotary group's wheels back (road impulse about -95
+	N·m·s) and slipped the 6-speed clutch at its 1170 N·m cap through gears 3-5
+	(DMC L380, recordings 20261101_030143+).
+]]
 local function collectGroup(Engine)
 	local Engines, Seen, Stack = {}, {}, { Engine }
+	local Boxes, Child, HasEngine = {}, {}, {}
+	local Owners = wheelOwners()
 	while #Stack > 0 do
 		local E = table.remove(Stack)
 		if IsValid(E) and not Seen[E] then
@@ -747,14 +862,40 @@ local function collectGroup(Engine)
 				Engines[#Engines + 1] = E
 				for _, Link in pairs(E.GearLink) do Stack[#Stack + 1] = Link.Ent end
 			else
-				for _, Master in pairs(E.Master or {}) do Stack[#Stack + 1] = Master end
+				Boxes[E] = true
+				for _, Master in pairs(E.Master or {}) do
+					if IsValid(Master) then
+						if Master:GetClass() == "acf_engine" then HasEngine[E] = true end
+						Stack[#Stack + 1] = Master
+					end
+				end
+				-- WheelLink only points down to children and Master only to engines, so the
+				-- path back up to the box feeding this one is ParentBox.
+				if IsValid(E.ParentBox) then
+					Stack[#Stack + 1] = E.ParentBox
+					Child[E] = true
+				end
 				for _, Link in pairs(E.WheelLink or {}) do
-					if IsValid(Link.Ent) and Link.Ent.IsGeartrain then Stack[#Stack + 1] = Link.Ent end
+					local Ent = Link.Ent
+					if IsValid(Ent) and not Link.Notvalid then
+						if Ent.IsGeartrain then
+							Stack[#Stack + 1] = Ent
+							Child[Ent] = true
+						else
+							for _, B in ipairs(Owners[Ent] or {}) do Stack[#Stack + 1] = B end
+						end
+					end
 				end
 			end
 		end
 	end
-	return Engines
+	-- An engineless, parentless box reached through a wheel is a root of the group: a
+	-- trailer axle that shares a wheel only brakes through it.
+	local Roots = {}
+	for Box in pairs(Boxes) do
+		if not HasEngine[Box] and not Child[Box] then Roots[#Roots + 1] = Box end
+	end
+	return Engines, Roots
 end
 
 local function contraptionFilter(Engine)
@@ -780,7 +921,7 @@ local function debugReport(Group, Ctx, Dt)
 	if Level <= 0 then return end
 
 	local Now = CurTime()
-	local Chassis = ACE.GetPhysicalParent(Group[1])
+	local Chassis = mountBody(Group[1])
 	local CPhys = IsValid(Chassis) and Chassis:GetPhysicsObject()
 	local CVel = IsValid(CPhys) and CPhys:GetVelocity() or vector_origin
 	local CAng = IsValid(CPhys) and CPhys:GetAngleVelocity() or vector_origin
@@ -825,9 +966,11 @@ local function debugReport(Group, Ctx, Dt)
 	end
 	for _, Box in ipairs(Ctx.BoxList) do
 		local D = Box.Mob or {}
-		MsgN(string.format("  gearbox %s gear=%s ratio=%s clutchCap=%s driveCap=%s diff=%s inRPM=%.0f brakeL=%s brakeR=%s assisted=%s",
+		MsgN(string.format("  gearbox %s gear=%s ratio=%s clutchCap=%s driveCap=%s diff=%s inRPM=%.0f brakeL=%s brakeR=%s assisted=%s lock=%s(%s) slip=%.0f load=%s ot=%s(%s)",
 			tostring(Box), tostring(Box.Gear), fmt(D.Ratio), fmt(D.ClutchCap), tostring(D.DriveCap and fmt(D.DriveCap)), tostring(D.Diff),
-			(D.InputW or 0) * 30 / math.pi, fmt(D.Brake and D.Brake[0]), fmt(D.Brake and D.Brake[1]), tostring(M.IsAssisted(Box))))
+			(D.InputW or 0) * 30 / math.pi, fmt(D.Brake and D.Brake[0]), fmt(D.Brake and D.Brake[1]), tostring(M.IsAssisted(Box)),
+			tostring(Box.MobAssistLocked), tostring(Box.MobAssistWhy), (D.ClutchSlip or 0) * 30 / math.pi,
+			fmt(Box.MobClutchLoad), tostring(Box.OverTorque), tostring(Box.OverTorqueCause)))
 	end
 	for _, W in ipairs(Ctx.WheelList) do
 		local G = W.Ground
@@ -988,6 +1131,12 @@ local function staticHold(Ctx, EngineDescs, Roots, Dt)
 		-- The cylinders' trapped air changes in place during the trial.
 		if E.State.Charge then Copy.Charge = table.Copy(E.State.Charge) end
 		SavedStates[E] = Copy
+		-- From rest means the crank too: whatever spin the last real solve left in the
+		-- engine went through the gears and spun the wheels past the tolerance, so the
+		-- trial rejected a hold the drivetrain could keep - and kept rejecting it, since
+		-- a released wheel rolled and re-spun the engine (DMC L380, buggy: the brake
+		-- lock flapped "brake overpowered" every half second, parked cars rolled away).
+		E.State.W = 0
 	end
 	for _, Box in ipairs(Ctx.BoxList) do
 		local D = Box.Mob
@@ -1038,7 +1187,7 @@ local function solveGroup(Ctx, EngineDescs, Roots, PhysMass, TotalMass, Dt)
 		match (about 60-70 % front on road vehicles, estimated): the trailing wheels get
 		less torque so they are not the first to lock, which would swing the vehicle round.
 	]]
-	local Root = Ctx.WheelList[1] and ACE.GetPhysicalParent(Ctx.WheelList[1].Box)
+	local Root = Ctx.WheelList[1] and mountBody(Ctx.WheelList[1].Box)
 	local RootPhys = IsValid(Root) and Root:GetPhysicsObject()
 	local MassCenter, TravelDir
 	if IsValid(RootPhys) then
@@ -1307,7 +1456,7 @@ local function solveGroup(Ctx, EngineDescs, Roots, PhysMass, TotalMass, Dt)
 				keeping the parked-creep limit cycle alive after the wheels were freed.
 			]]
 			if not W.FreeAll then
-				local Root = ACE.GetPhysicalParent(W.Box)
+				local Root = mountBody(W.Box)
 				if IsValid(Ctx.Chassis) and IsValid(Root) and Root ~= Ctx.Chassis and (Root == W.Hub or W.Hub == Ctx.Chassis) then
 					Root = Ctx.Chassis
 				end
@@ -1422,7 +1571,7 @@ local function solvePhysics(Engine, Group, Dt)
 		Boxes = {}, BoxList = {},
 		Wheels = {}, WheelList = {},
 		Filter = contraptionFilter(Engine),
-		Chassis = ACE.GetPhysicalParent(Engine),
+		Chassis = mountBody(Engine),
 	}
 
 	local EngineDescs = {}
@@ -1450,7 +1599,19 @@ local function solvePhysics(Engine, Group, Dt)
 		scaled by MassRatio) without starving the engine, starter or clutch of torque.
 	]]
 	if #EngineDescs == 0 then return nil end
-	solveGroup(Ctx, EngineDescs, nil, PhysMass, TotalMass, Dt)
+	--[[
+		Gearbox trees that share wheels with the group but no engine drives (collectGroup's
+		Roots): solved alongside as roots so their wheels and brakes are part of the same
+		solve. Marked so the standalone-gearbox hook does not solve them again this tick.
+	]]
+	local RootDescs = {}
+	for _, Box in ipairs(Engine.MobRoots or {}) do
+		if IsValid(Box) and Box.Legal ~= false then
+			Box.MobGroupedTick = engine.TickCount()
+			if not Ctx.Boxes[Box] then RootDescs[#RootDescs + 1] = buildGearbox(Box, Ctx) end
+		end
+	end
+	solveGroup(Ctx, EngineDescs, RootDescs, PhysMass, TotalMass, Dt)
 	if M.Log then M.Log.Frame(M.InStep and "step" or "tick", Group, Ctx, Dt) end
 	return Ctx
 end
@@ -1611,7 +1772,7 @@ function M.Tick(Engine, Dt)
 	local Now = CurTime()
 	if Engine.MobSolvedAt == Now then return end
 
-	local Group = collectGroup(Engine)
+	local Group, Roots = collectGroup(Engine)
 	for _, E in ipairs(Group) do E.MobSolvedAt = Now end
 
 	local Lead = groupLeader(Group)
@@ -1621,6 +1782,7 @@ function M.Tick(Engine, Dt)
 		if E ~= Lead then stopController(E) end
 	end
 	Lead.MobGroup = Group
+	Lead.MobRoots = Roots
 
 	if InStepConVar:GetBool() then
 		--[[
@@ -1678,7 +1840,7 @@ local function treeNeedsSolve(Box, Depth)
 		if IsValid(Ent) then
 			if Ent.IsGeartrain then
 				if treeNeedsSolve(Ent, Depth + 1) then return true end
-			elseif Link.Mob and IsValid(Link.Mob.BrakeLock) then
+			elseif Ent.ACEMobWheel and IsValid(Ent.ACEMobWheel.BrakeLock) then
 				return true
 			end
 		end
@@ -1696,10 +1858,10 @@ function M.TickStandalone(Box, Dt)
 		Boxes = {}, BoxList = {},
 		Wheels = {}, WheelList = {},
 		Filter = contraptionFilter(Box),
-		Chassis = ACE.GetPhysicalParent(Box),
+		Chassis = mountBody(Box),
 	}
 	local Desc = buildGearbox(Box, Ctx)
-	local PhysMass, TotalMass = contraptionMass({ ACE.GetPhysicalParent(Box) or Box })
+	local PhysMass, TotalMass = contraptionMass({ mountBody(Box) })
 	solveGroup(Ctx, {}, { Desc }, PhysMass, TotalMass, Dt)
 	if M.Log then M.Log.Frame("standalone", nil, Ctx, Dt) end
 	applyBrakeLocks(Ctx.WheelList)
@@ -1735,6 +1897,10 @@ hook.Add("Think", "ACE_Mobility_StandaloneGearboxes", function()
 	end
 	local Dt = engine.TickInterval()
 	for _, Box in ipairs(StandaloneRoots) do
-		if IsValid(Box) and Box.Legal ~= false and treeNeedsSolve(Box, 0) then M.TickStandalone(Box, Dt) end
+		-- A root already solved as part of an engine group (a wheel shared with it) is
+		-- skipped for a couple of ticks, so nothing is solved twice in one step.
+		if IsValid(Box) and Box.Legal ~= false
+			and engine.TickCount() - (Box.MobGroupedTick or -10) > 2
+			and treeNeedsSolve(Box, 0) then M.TickStandalone(Box, Dt) end
 	end
 end)

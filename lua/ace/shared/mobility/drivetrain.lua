@@ -147,6 +147,9 @@ local function kinematicInputW(Gearbox)
 			if Out.Gearbox and Out.Gearbox.ClutchFree then return nil end
 			if Out.Wheel then W = Out.Wheel.Anchored and 0 or Out.Wheel.W elseif Out.Gearbox then W = kinematicInputW(Out.Gearbox) end
 			if W == nil then return nil end
+			-- The box sees its output speed as Sign * wheel W: a wheel record shared with a
+			-- box facing the other way reads the same spin with the opposite sign.
+			W = W * (Out.Sign or 1)
 			local S = Out.Side == 0 and 0 or 1
 			Sum[S], N[S] = Sum[S] + W, N[S] + 1
 		end
@@ -269,7 +272,7 @@ buildGearbox = function(Sys, Gearbox)
 						OutCap = OutCap and min(OutCap, Out.Gearbox.ClutchCap) or Out.Gearbox.ClutchCap
 					end
 					if Gearbox.DriveCap then OutCap = OutCap and min(OutCap, Gearbox.DriveCap) or Gearbox.DriveCap end
-					local C = addConstraint(Sys, { In, outputBody(Sys, Out) }, { 1, -R }, OutCap, 0, "gear")
+					local C = addConstraint(Sys, { In, outputBody(Sys, Out) }, { 1, -R * (Out.Sign or 1) }, OutCap, 0, "gear")
 					Gearbox.Drive[#Gearbox.Drive + 1] = C
 					if Gearbox.Dual then Gearbox.SideClutches[#Gearbox.SideClutches + 1] = { C = C, Scale = 1, Side = S } end
 				end
@@ -281,7 +284,7 @@ buildGearbox = function(Sys, Gearbox)
 			local SideBodies = {}
 			for S = 0, 1 do
 				local First = outputBody(Sys, Sides[S][1])
-				local SB = Solver.Body(SideJ, First.W)
+				local SB = Solver.Body(SideJ, First.W * (Sides[S][1].Sign or 1))
 				Sys.Bodies[#Sys.Bodies + 1] = SB
 				SideBodies[S] = SB
 				-- Side clutch ratings are input-shaft torque (as on locked dual boxes); the clutch sits
@@ -293,7 +296,7 @@ buildGearbox = function(Sys, Gearbox)
 					if Out.Gearbox and Out.Gearbox.ClutchCap then
 						OutCap = OutCap and min(OutCap, Out.Gearbox.ClutchCap) or Out.Gearbox.ClutchCap
 					end
-					local C = addConstraint(Sys, { SB, outputBody(Sys, Out) }, { 1, -1 }, OutCap, 0, "side clutch")
+					local C = addConstraint(Sys, { SB, outputBody(Sys, Out) }, { 1, -(Out.Sign or 1) }, OutCap, 0, "side clutch")
 					Gearbox.SideClutches[#Gearbox.SideClutches + 1] = { C = C, Scale = abs(R), Side = S }
 				end
 			end
@@ -305,15 +308,17 @@ buildGearbox = function(Sys, Gearbox)
 			-- Differential between the first output on each side; extra outputs on a side
 			-- are rigidly tied to that side's first output.
 			local L, Rt = outputBody(Sys, Sides[0][1]), outputBody(Sys, Sides[1][1])
-			Gearbox.Drive[1] = addConstraint(Sys, { In, L, Rt }, { 1, -R / 2, -R / 2 }, Gearbox.DriveCap, 0, "diff")
+			local SL, SR = Sides[0][1].Sign or 1, Sides[1][1].Sign or 1
+			Gearbox.Drive[1] = addConstraint(Sys, { In, L, Rt }, { 1, -R / 2 * SL, -R / 2 * SR }, Gearbox.DriveCap, 0, "diff")
 			for S = 0, 1 do
 				local First = outputBody(Sys, Sides[S][1])
+				local SFirst = Sides[S][1].Sign or 1
 				for I = 2, #Sides[S] do
-					addConstraint(Sys, { First, outputBody(Sys, Sides[S][I]) }, { 1, -1 }, nil, 0, "side")
+					addConstraint(Sys, { First, outputBody(Sys, Sides[S][I]) }, { SFirst, -(Sides[S][I].Sign or 1) }, nil, 0, "side")
 				end
 			end
 			if Gearbox.Diff == "lsd" then
-				Gearbox.LSD = addConstraint(Sys, { L, Rt }, { 1, -1 }, 0, 0, "lsd")
+				Gearbox.LSD = addConstraint(Sys, { L, Rt }, { SL, -SR }, 0, 0, "lsd")
 			end
 		end
 	end
@@ -322,7 +327,7 @@ buildGearbox = function(Sys, Gearbox)
 	-- tank can pivot in neutral (Merritt-Brown principle).
 	if Gearbox.SteerRatio and HasL and HasR then
 		local L, Rt = outputBody(Sys, Sides[0][1]), outputBody(Sys, Sides[1][1])
-		Gearbox.SteerC = addConstraint(Sys, { L, Rt, In }, { 0.5, -0.5, 0 }, Gearbox.SteerCap, 0, "steer")
+		Gearbox.SteerC = addConstraint(Sys, { L, Rt, In }, { 0.5 * (Sides[0][1].Sign or 1), -0.5 * (Sides[1][1].Sign or 1), 0 }, Gearbox.SteerCap, 0, "steer")
 	end
 
 	-- Brakes act between each driven wheel and the chassis. They reach free wheels too: the
@@ -478,7 +483,7 @@ local function rigidWheels(Sys, Gearbox, Wheels, Sign)
 			local B = Sys.WheelBodies[Out.Wheel.Key]
 			-- Track sprockets keep their own: a track's slip against the ground is left to the physics engine.
 			if B and B.GroundBody and B.TyreC and not B.GroundBody.Shared and not Out.Wheel.Meshed then
-				B.RoadSign = Sign
+				B.RoadSign = Sign * (Out.Sign or 1)
 				Wheels[#Wheels + 1] = B
 			end
 		elseif Child and not Child.BrakeOnly then
