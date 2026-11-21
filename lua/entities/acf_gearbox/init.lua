@@ -1016,7 +1016,9 @@ local function overTorqueCause(Box, Mob)
 	if Box.ClutchBurnt then return "burnt" end
 	if (Box.MobFade or 1) < 0.95 then return "fade" end
 	local Shaft, Eng = Mob.InputW or 0, Box.MobEngineW or 0
-	if Box.CVT and Box.Gear == 1 and math.abs(Shaft) * 30 / math.pi < (Box.TargetMinRPM or 0)
+	-- TargetMinRPM can be a string (dupe modifier data): arithmetic coerces it elsewhere,
+	-- comparisons do not.
+	if Box.CVT and Box.Gear == 1 and math.abs(Shaft) * 30 / math.pi < (tonumber(Box.TargetMinRPM) or 0)
 		and math.abs(Eng) > math.abs(Shaft) then
 		return "cvt_low"
 	end
