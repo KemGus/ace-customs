@@ -1,6 +1,6 @@
 --[[
 	ACE Customs: the mobility rework (drivetrain, engines, cooling, heaters, sounds) as an
-	addition to ACE Canary. Built by tools/customs/build_customs.py from the mobility-realism
+	addition to ACE Canary. Built by tools/customs/build_customs.py from the ace-customs
 	branch; nothing here edits ACE's own files.
 
 	Runs after ACE's autorun (acf_globals.lua sorts before this file) and then:
@@ -18,6 +18,12 @@ if not ACE or not ACE.DefineEngine or not ACE.Weapons then
 end
 
 ACE.Customs = { Loaded = true }
+
+-- Strings the branch adds to ACE's .properties files. Customs cannot change ACE files, so
+-- it adds them at runtime instead.
+if CLIENT then
+	language.Add("tool.acemenu.reload", "Copy an engine or gearbox into the menu")
+end
 
 local Override = "ace_customs/override/"
 local Patches  = "ace_customs/patches/"

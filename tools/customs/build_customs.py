@@ -138,6 +138,9 @@ def build(ref, out):
     changes = []
     for line in git("diff", "--name-status", "--no-renames", CANARY_BASE, ref).splitlines():
         status, path = line.split("\t", 1)
+        # The added localization keys are shipped via language.Add in the bootstrap instead.
+        if path == "resource/localization/en/armoredcombatextended.properties":
+            continue
         if path.startswith(SKIP_PREFIXES) or path.endswith(SKIP_SUFFIXES) or path == "addon.json":
             continue
         changes.append((status, path))
